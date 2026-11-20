@@ -1,0 +1,19 @@
+[Unit]
+Description=PostgreSQL 16 for the OTUS lab
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+User=postgres
+Group=postgres
+RuntimeDirectory=otus-postgresql
+RuntimeDirectoryMode=0755
+ExecStart=/usr/lib/postgresql/16/bin/postgres -D /var/lib/postgresql/16/main -c config_file=/etc/otus-postgresql/postgresql.conf
+KillSignal=SIGINT
+TimeoutStopSec=120
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

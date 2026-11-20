@@ -1,0 +1,261 @@
+---
+# Настраивает PostgreSQL 16 на node1 и node2 и ежедневный бэкап на backup.
+- name: Развернуть PostgreSQL и резервное копирование
+  hosts: all
+  become: true
+  gather_facts: false
+  vars:
+    pg_bin: /usr/lib/postgresql/16/bin
+    pg_data: /var/lib/postgresql/16/main
+    pg_etc: /etc/otus-postgresql
+    pg_socket: /run/otus-postgresql
+    pg_remote_role: "{{ 'otus_replica' if inventory_hostname == 'node2' else 'otus_backup' }}"
+
+  tasks:
+    - name: Создать каталог настроек системного резолвера
+      ansible.builtin.file:
+        path: /etc/systemd/resolved.conf.d
+        state: directory
+        mode: "0755"
+
+    - name: Настроить DNS VirtualBox NAT для установки пакетов
+      ansible.builtin.copy:
+        dest: /etc/systemd/resolved.conf.d/90-otus-vbox-nat.conf
+        mode: "0644"
+        content: |
+          [Resolve]
+          DNS=10.0.2.3
+          Domains=~.
+          DNSSEC=no
+      notify: Перечитать DNS
+
+    - name: Применить DNS до загрузки пакетов
+      ansible.builtin.meta: flush_handlers
+
+    - name: Установить зависимости APT и поддержку переключения пользователя
+      ansible.builtin.apt:
+        name: [ca-certificates, acl]
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Установить ключ репозитория PGDG
+      ansible.builtin.get_url:
+        url: https://apt.postgresql.org/pub/repos/apt/ACCC4CF8.asc
+        dest: /usr/share/keyrings/otus-pgdg.asc
+        checksum: sha256:0144068502a1eddd2a0280ede10ef607d1ec592ce819940991203941564e8e76
+        mode: "0644"
+
+    - name: Подключить архив PGDG для Ubuntu 20.04
+      ansible.builtin.apt_repository:
+        repo: deb [signed-by=/usr/share/keyrings/otus-pgdg.asc] https://apt-archive.postgresql.org/pub/repos/apt focal-pgdg main
+        filename: otus-pgdg
+        state: present
+
+    - name: Установить postgresql-common
+      ansible.builtin.apt:
+        name: postgresql-common
+        state: present
+
+    - name: Отключить автоматическое создание пакетного кластера
+      ansible.builtin.lineinfile:
+        path: /etc/postgresql-common/createcluster.conf
+        regexp: '^#?\s*create_main_cluster\s*='
+        line: 'create_main_cluster = false'
+
+    - name: Установить PostgreSQL 16 и клиентские утилиты
+      ansible.builtin.apt:
+        name: [postgresql-16, postgresql-client-16]
+        state: present
+        policy_rc_d: 101
+
+    - name: Создать каталог конфигурации
+      ansible.builtin.file:
+        path: "{{ pg_etc }}"
+        state: directory
+        mode: "0755"
+
+    - name: Настроить основной сервер и реплику
+      when: inventory_hostname != 'backup'
+      block:
+        - name: Создать родительский каталог PGDATA
+          ansible.builtin.file:
+            path: "{{ pg_data | dirname }}"
+            state: directory
+            owner: postgres
+            group: postgres
+            mode: "0750"
+
+        - name: Установить конфигурацию кластера и правила доступа
+          ansible.builtin.template:
+            src: "{{ item }}.j2"
+            dest: "{{ pg_etc }}/{{ item }}"
+            owner: root
+            group: postgres
+            mode: "0640"
+          loop: [postgresql.conf, pg_hba.conf]
+          notify: Перезапустить PostgreSQL
+
+        - name: Установить настройки потоковой репликации
+          ansible.builtin.template:
+            src: standby.conf.j2
+            dest: "{{ pg_etc }}/standby.conf"
+            owner: root
+            group: postgres
+            mode: "0640"
+          when: inventory_hostname == 'node2'
+          notify: Перезапустить PostgreSQL
+
+        - name: Установить пароль подключения реплики с правами 0600
+          ansible.builtin.template:
+            src: pgpass.j2
+            dest: /var/lib/postgresql/.pgpass
+            owner: postgres
+            group: postgres
+            mode: "0600"
+          when: inventory_hostname == 'node2'
+          no_log: true
+          notify: Перезапустить PostgreSQL
+
+        - name: Подготовить PGDATA и опубликовать после успешного создания
+          become_user: postgres
+          ansible.builtin.shell: |
+            set -eu
+            work=$(mktemp -d "{{ pg_data | dirname }}/.bootstrap.XXXXXXXX")
+            trap 'rm -rf -- "$work"' EXIT
+            {% if inventory_hostname == 'node1' %}
+            "{{ pg_bin }}/initdb" -D "$work/data" --encoding=UTF8 --locale=C --data-checksums
+            {% else %}
+            "{{ pg_bin }}/pg_basebackup" --host="{{ pg_nodes.node1 }}" --username=otus_replica --no-password \
+                --pgdata="$work/data" --wal-method=stream --slot=node2_slot --checkpoint=fast
+            touch "$work/data/standby.signal"
+            {% endif %}
+            mv -T -- "$work/data" "{{ pg_data }}"
+          args:
+            creates: "{{ pg_data }}/PG_VERSION"
+          environment:
+            PGPASSFILE: /var/lib/postgresql/.pgpass
+            PGCONNECT_TIMEOUT: "10"
+          register: bootstrap
+          until: bootstrap is succeeded
+          retries: 4
+          delay: 10
+
+        - name: Установить unit PostgreSQL
+          ansible.builtin.copy:
+            src: otus-postgresql.service
+            dest: /etc/systemd/system/otus-postgresql.service
+            mode: "0644"
+          notify: Перезапустить PostgreSQL
+
+        - name: Применить конфигурацию PostgreSQL
+          ansible.builtin.meta: flush_handlers
+
+        - name: Включить PostgreSQL
+          ansible.builtin.systemd_service:
+            name: otus-postgresql.service
+            daemon_reload: true
+            enabled: true
+            state: started
+
+        - name: Дождаться готовности PostgreSQL
+          become_user: postgres
+          ansible.builtin.command: "{{ pg_bin }}/pg_isready -h {{ pg_socket }} -q"
+          register: pg_ready
+          until: pg_ready.rc == 0
+          retries: 20
+          delay: 2
+          changed_when: false
+
+        - name: Создать роли репликации, постоянный слот и контрольную таблицу
+          become_user: postgres
+          ansible.builtin.command:
+            argv: ["{{ pg_bin }}/psql", -X, -h, "{{ pg_socket }}", -d, postgres, -v, ON_ERROR_STOP=1]
+            stdin: |
+              {% for role in ['otus_replica', 'otus_backup'] %}
+              DO $role$ BEGIN
+                IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{{ role }}') THEN
+                  CREATE ROLE {{ role }} LOGIN REPLICATION PASSWORD '{{ lookup('ansible.builtin.password', playbook_dir ~ '/../.vagrant/pg-secrets/' ~ role, length=48, chars=['ascii_letters', 'digits']) }}';
+                  RAISE NOTICE 'initialized';
+                END IF;
+              END $role$;
+              {% endfor %}
+              SELECT (pg_create_physical_replication_slot('node2_slot', true)).slot_name
+              WHERE NOT EXISTS (SELECT FROM pg_replication_slots WHERE slot_name = 'node2_slot');
+              CREATE TABLE IF NOT EXISTS public.otus_probe (token text PRIMARY KEY);
+              INSERT INTO public.otus_probe VALUES ('initial') ON CONFLICT DO NOTHING;
+          register: pg_primary_setup
+          changed_when: >-
+            'initialized' in pg_primary_setup.stderr
+            or '(1 row)' in pg_primary_setup.stdout
+            or 'INSERT 0 1' in pg_primary_setup.stdout
+          when: inventory_hostname == 'node1'
+          no_log: true
+
+    - name: Настроить сервер резервного копирования
+      when: inventory_hostname == 'backup'
+      block:
+        - name: Создать пользователя для бэкапов
+          ansible.builtin.user:
+            name: pgbackup
+            system: true
+            home: /var/lib/pgbackup
+            create_home: true
+            shell: /usr/sbin/nologin
+
+        - name: Создать закрытый каталог бэкапов
+          ansible.builtin.file:
+            path: /var/lib/pgbackup/backups
+            state: directory
+            owner: pgbackup
+            mode: "0700"
+
+        - name: Установить пароль роли бэкапа с правами 0600
+          ansible.builtin.template:
+            src: pgpass.j2
+            dest: /var/lib/pgbackup/.pgpass
+            owner: pgbackup
+            mode: "0600"
+          no_log: true
+
+        - name: Задать адрес primary для сервиса бэкапов
+          ansible.builtin.template:
+            src: backup.env.j2
+            dest: "{{ pg_etc }}/backup.env"
+            mode: "0644"
+
+        - name: Установить скрипты бэкапа и пробного восстановления
+          ansible.builtin.copy:
+            src: "{{ item }}"
+            dest: "/usr/local/bin/{{ item }}"
+            mode: "0755"
+          loop: [otus-pg-backup, otus-pg-restore-check]
+
+        - name: Установить сервис и таймер бэкапов
+          ansible.builtin.copy:
+            src: "{{ item }}"
+            dest: "/etc/systemd/system/{{ item }}"
+            mode: "0644"
+          loop: [otus-pg-backup.service, otus-pg-backup.timer]
+
+        - name: Включить ежедневное резервное копирование
+          ansible.builtin.systemd_service:
+            name: otus-pg-backup.timer
+            daemon_reload: true
+            enabled: true
+            state: started
+
+  handlers:
+    - name: Перечитать DNS
+      ansible.builtin.systemd_service:
+        name: systemd-resolved.service
+        state: restarted
+
+    - name: Перезапустить PostgreSQL
+      ansible.builtin.systemd_service:
+        name: otus-postgresql.service
+        daemon_reload: true
+        state: restarted
+
+# Версия 1 · 2026-11-16 · PostgreSQL 16, слот репликации и ежедневные бэкапы.
+# Версия 2 · 2026-11-17 · Пакеты Focal из подписанного архива PGDG и настройки DNS NAT.

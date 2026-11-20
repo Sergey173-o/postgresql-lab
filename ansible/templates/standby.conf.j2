@@ -1,0 +1,3 @@
+# Параметры восстановления PostgreSQL 16. Режим реплики включает standby.signal.
+primary_conninfo = 'host={{ pg_nodes.node1 }} port=5432 user=otus_replica application_name=node2 passfile=/var/lib/postgresql/.pgpass'
+primary_slot_name = 'node2_slot'

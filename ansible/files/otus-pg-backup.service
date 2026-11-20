@@ -1,0 +1,13 @@
+[Unit]
+Description=Verified physical backup of the OTUS PostgreSQL primary
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=pgbackup
+Group=pgbackup
+Environment=PGPASSFILE=/var/lib/pgbackup/.pgpass PGCONNECT_TIMEOUT=10
+EnvironmentFile=/etc/otus-postgresql/backup.env
+UMask=0077
+ExecStart=/usr/local/bin/otus-pg-backup

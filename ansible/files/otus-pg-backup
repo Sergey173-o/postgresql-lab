@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Делает физический бэкап primary с WAL и публикует только проверенную копию.
+set -euo pipefail
+umask 077
+
+pg_bin=/usr/lib/postgresql/16/bin
+backup_root=/var/lib/pgbackup/backups
+: "${PGHOST:?Укажи IP primary в PGHOST}"
+
+# Блокировка защищает от одновременного запуска вручную и по расписанию.
+exec 9>"$backup_root/.lock"
+flock -n 9
+work=$(mktemp -d "$backup_root/.incoming.XXXXXXXX")
+trap 'rm -rf -- "$work"' EXIT
+
+"$pg_bin/pg_basebackup" --host="$PGHOST" --username=otus_backup --no-password \
+    --pgdata="$work/data" --wal-method=stream --checkpoint=fast
+"$pg_bin/pg_verifybackup" "$work/data"
+
+backup_name="$(date -u +%Y%m%dT%H%M%SZ)-${work##*.}"
+mv -T -- "$work/data" "$backup_root/$backup_name"
+ln -s -- "$backup_name" "$work/latest"
+mv -Tf -- "$work/latest" "$backup_root/latest"
+printf 'Проверенный бэкап: %s/%s\n' "$backup_root" "$backup_name"
+
+# Версия 1 · 2026-11-16 · Копирование с WAL, проверка манифеста и публикация.

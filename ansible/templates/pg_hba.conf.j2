@@ -1,0 +1,7 @@
+# Локальное администрирование от пользователя postgres.
+local   all          postgres           peer
+{% if inventory_hostname == 'node1' %}
+# Роли реплики и бэкапа имеют доступ только к потоку репликации со своих ВМ.
+host    replication  otus_replica      {{ pg_nodes.node2 }}/32   scram-sha-256
+host    replication  otus_backup       {{ pg_nodes.backup }}/32  scram-sha-256
+{% endif %}

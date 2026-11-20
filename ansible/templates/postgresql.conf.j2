@@ -1,0 +1,15 @@
+# Общие параметры PostgreSQL для primary и standby.
+listen_addresses = '{{ pg_nodes[inventory_hostname] }}'
+port = 5432
+unix_socket_directories = '/run/otus-postgresql'
+hba_file = '{{ pg_etc }}/pg_hba.conf'
+password_encryption = 'scram-sha-256'
+wal_level = 'replica'
+max_wal_senders = 8
+max_replication_slots = 4
+max_slot_wal_keep_size = '2GB'
+hot_standby = on
+
+{% if inventory_hostname == 'node2' %}
+include 'standby.conf'
+{% endif %}

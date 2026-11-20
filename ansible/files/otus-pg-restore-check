@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Поднимает копию бэкапа через закрытый Unix-сокет и проверяет тестовую строку.
+set -euo pipefail
+umask 077
+
+pg_bin=/usr/lib/postgresql/16/bin
+backup_root=/var/lib/pgbackup/backups
+backup_name=${1:-latest}
+token=${2:-initial}
+if [[ ! "$backup_name" =~ ^(latest|[0-9]{8}T[0-9]{6}Z-[a-zA-Z0-9]+)$ ]] ||
+   [[ ! "$token" =~ ^(initial|[a-f0-9-]+)$ ]]; then
+    printf 'Использование: %s [latest|имя_копии] [маркер]\n' "$0" >&2
+    exit 2
+fi
+
+source_dir=$(realpath -e -- "$backup_root/$backup_name")
+"$pg_bin/pg_verifybackup" "$source_dir"
+work=$(mktemp -d /tmp/otus-pg-restore.XXXXXXXX)
+
+# При сбое старта выводим журнал. Работающий кластер останавливаем до очистки.
+cleanup() {
+    local rc=$?
+    if (( rc != 0 )) && [[ -f "$work/postgres.log" ]]; then
+        tail -n 30 "$work/postgres.log" >&2
+    fi
+    if [[ -f "$work/data/postmaster.pid" ]]; then
+        "$pg_bin/pg_ctl" -D "$work/data" -m fast -w stop >/dev/null || return 1
+    fi
+    rm -rf -- "$work"
+}
+trap cleanup EXIT
+cp -a -- "$source_dir" "$work/data"
+
+printf 'local all all trust\n' > "$work/pg_hba.conf"
+cat > "$work/postgresql.conf" <<CONF
+listen_addresses = ''
+port = 55432
+unix_socket_directories = '$work'
+hba_file = '$work/pg_hba.conf'
+CONF
+
+"$pg_bin/pg_ctl" -D "$work/data" -l "$work/postgres.log" \
+    -o "-c config_file=$work/postgresql.conf" -w start >/dev/null
+# trust действует только через сокет в закрытом каталоге pgbackup.
+result=$("$pg_bin/psql" -X -h "$work" -p 55432 -U postgres -d postgres -Atq -v ON_ERROR_STOP=1 \
+    -c "SELECT token FROM public.otus_probe WHERE token = '$token' AND NOT pg_is_in_recovery()")
+if [[ "$result" != "$token" ]]; then
+    printf 'Маркер %s в восстановленной копии отсутствует\n' "$token" >&2
+    exit 1
+fi
+printf 'Восстановление %s подтверждено. Маркер: %s\n' "${source_dir##*/}" "$result"
+
+# Версия 1 · 2026-11-16 · Изолированное пробное восстановление без сетевого порта.

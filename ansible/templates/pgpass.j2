@@ -1,0 +1,1 @@
+{{ pg_nodes.node1 }}:5432:replication:{{ pg_remote_role }}:{{ lookup('ansible.builtin.password', playbook_dir ~ '/../.vagrant/pg-secrets/' ~ pg_remote_role, length=48, chars=['ascii_letters', 'digits']) }}
